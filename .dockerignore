@@ -1,0 +1,11 @@
+.cache
+.opencode
+Users
+.env
+PE.md
+FI.md
+ri.txt
+data/*
+!data/.gitkeep
+__pycache__/
+.idea

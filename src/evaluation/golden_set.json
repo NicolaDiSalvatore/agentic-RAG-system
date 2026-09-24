@@ -1,0 +1,17 @@
+[
+  {
+    "question": "A question with no relevant answer in your corpus, e.g. small talk",
+    "ground_truth": "The system should decline or answer without retrieval",
+    "expected_route": "no_retrieval"
+  },
+  {
+    "question": "A direct factual question answerable from one chunk",
+    "ground_truth": "Replace with the correct answer",
+    "expected_route": "simple"
+  },
+  {
+    "question": "A question requiring combining info from multiple parts of your corpus",
+    "ground_truth": "Replace with the correct synthesized answer",
+    "expected_route": "complex"
+  }
+]
