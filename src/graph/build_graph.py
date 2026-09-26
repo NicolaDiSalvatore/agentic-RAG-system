@@ -1,19 +1,5 @@
-"""Wire the node functions into a compiled LangGraph graph.
-
-WHY THIS EXISTS
-The resulting graph shape roughly matches this:
-
-    START -> route_node -> (conditional)
-                              |-- "no_retrieval" --> no_retrieval_node --> END
-                              |-- "simple"       --> retrieve_node --> grade_node -> (conditional)
-                              |                                                        |-- sufficient --> generate_node --> END
-                              |                                                        |-- insufficient + retries left --> retrieve_node (loop back, wider budget)
-                              |                                                        |-- insufficient + no retries left --> generate_node (partial best-effort answer)
-                              |-- "complex"      --> decompose_node --> retrieve_node --> grade_node -> (conditional)
-                                                                                                           |-- sufficient --> generate_node --> END
-                                                                                                           |-- insufficient + retries left --> retrieve_node (loop back, wider budget)
-                                                                                                           |-- insufficient + no retries left --> generate_node (partial best-effort answer)
-
+"""
+Wire the node functions into a compiled LangGraph graph.
 """
 
 from langgraph.graph import END, StateGraph

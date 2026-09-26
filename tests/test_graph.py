@@ -368,7 +368,7 @@ def test_generate_node_calls_llm_when_context_sufficient():
     chunks = [{"text": "ctx", "source": "s.md"}]
     with patch("src.graph.nodes.generate_answer", return_value="Good answer") as llm:
         result = generate_node(make_state(context_sufficient=True, retrieved_chunks=chunks))
-    llm.assert_called_once_with("What is the capital of France?", chunks)
+    llm.assert_called_once_with("What is the capital of France?", chunks, plain_text=True)
     assert result == {"answer": "Good answer"}
 
 
@@ -376,7 +376,9 @@ def test_generate_node_uses_partial_answer_when_insufficient():
     chunks = [{"text": "ctx", "source": "s"}]
     with patch("src.graph.nodes.generate_partial_answer", return_value="Partial best-effort") as llm:
         result = generate_node(make_state(context_sufficient=False, retrieved_chunks=chunks))
-    llm.assert_called_once_with("What is the capital of France?", chunks, gaps=[])
+    llm.assert_called_once_with(
+        "What is the capital of France?", chunks, gaps=[], plain_text=True
+    )
     assert result == {"answer": "Partial best-effort"}
 
 
@@ -393,7 +395,7 @@ def test_generate_node_passes_uncovered_subquestions_as_gaps():
     with patch("src.graph.nodes.generate_partial_answer", return_value="Partial") as llm:
         result = generate_node(state)
     llm.assert_called_once_with(
-        "What is the capital of France?", chunks, gaps=["Who is Nemo?"]
+        "What is the capital of France?", chunks, gaps=["Who is Nemo?"], plain_text=True
     )
     assert result == {"answer": "Partial"}
 
@@ -416,8 +418,30 @@ def test_generate_node_defaults_to_dont_know_when_flag_missing():
 def test_no_retrieval_node_answers_without_context():
     with patch("src.graph.nodes.generate_answer", return_value="Paris is the capital.") as llm:
         result = no_retrieval_node(make_state())
-    llm.assert_called_once_with("What is the capital of France?", None)
+    llm.assert_called_once_with("What is the capital of France?", None, plain_text=True)
     assert result == {"answer": "Paris is the capital."}
+
+
+def test_classifier_callers_do_not_request_plain_text():
+    # route_node, decompose_node and _ask_yes_no all parse the raw model
+    # string, so they must keep receiving Markdown-free parsing input rather
+    # than a normalized answer.
+    with patch("src.graph.nodes.generate_answer", return_value="simple") as llm:
+        route_node(make_state())
+    assert llm.call_args.kwargs.get("plain_text") is not True
+
+    with patch(
+        "src.graph.nodes.generate_answer", return_value="Where is France?"
+    ) as llm:
+        decompose_node(make_state())
+    assert llm.call_args.kwargs.get("plain_text") is not True
+
+    chunks = [{"text": "ctx", "source": "s.md"}]
+    with patch("src.graph.nodes.generate_answer", return_value="YES") as llm:
+        grade_node(
+            make_state(retrieved_chunks=chunks, sub_questions=["What is France?"])
+        )
+    assert llm.call_args.kwargs.get("plain_text") is not True
 
 
 def _route_llm(routing_response, grade_response="YES", final_answer="Generated answer"):

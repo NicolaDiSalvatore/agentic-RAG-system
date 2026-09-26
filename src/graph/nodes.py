@@ -3,6 +3,7 @@ Individual node functions for the LangGraph agentic RAG graph.
 """
 
 
+
 from .state import GraphState
 from src.llm.langchain_llm import generate_answer, generate_partial_answer
 from src.indexing.retriever import build_hybrid_retriever, build_reranker
@@ -279,7 +280,7 @@ def grade_node(state: GraphState) -> dict:
 def generate_node(state: GraphState) -> dict:
     chunks = state.get("retrieved_chunks", [])
     if state.get("context_sufficient"):
-        answer = generate_answer(state["question"], chunks)
+        answer = generate_answer(state["question"], chunks, plain_text=True)
     elif chunks:
         # Best-effort partial answer that explicitly notes gaps instead of
         # returning a canned "don't know" string. Grade details pinpoint which
@@ -289,7 +290,9 @@ def generate_node(state: GraphState) -> dict:
             for item in (state.get("grade_details") or [])
             if not item.get("covered")
         ]
-        answer = generate_partial_answer(state["question"], chunks, gaps=uncovered)
+        answer = generate_partial_answer(
+            state["question"], chunks, gaps=uncovered, plain_text=True
+        )
     else:
         answer = "I don't have enough context to answer that question."
 
@@ -297,4 +300,4 @@ def generate_node(state: GraphState) -> dict:
 
 
 def no_retrieval_node(state: GraphState) -> dict:
-    return {"answer": generate_answer(state["question"], None)}
+    return {"answer": generate_answer(state["question"], None, plain_text=True)}

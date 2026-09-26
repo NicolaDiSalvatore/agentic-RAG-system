@@ -4,6 +4,11 @@ import sys
 from pathlib import Path
 import truststore
 from src.graph.build_graph import build_graph
+from src.llm.langchain_llm import (
+    cited_source_indices,
+    display_source_name,
+    split_sources_footer,
+)
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -46,7 +51,7 @@ if __name__ == "__main__":
                 for sq in update.get("sub_questions", []):
                     print("  -", sq)
             if args.debug and node_name == "retrieve":
-                print(f"\nRETRIEVE (attempt retry_count={result.get('retry_count', 0)}):")
+                print(f"\nRETRIEVED CONTEXT (attempt retry_count={result.get('retry_count', 0)}):")
                 for i, chunk in enumerate(update.get("retrieved_chunks", []), 1):
                     print(f"  [{i}] query={chunk.get('query', '?')!r}")
                     print(f"      source={chunk.get('source', '')}")
@@ -62,7 +67,14 @@ if __name__ == "__main__":
     print("\nROUTE:", result.get("route"))
     print("ANSWER:", result.get("answer"))
     print("SOURCES:")
-
-    for i, chunk in enumerate(result.get("retrieved_chunks", []), 1):
-        print(f"\nSOURCE {i}:")
-        print(str(chunk.get("text", ""))[:1000])
+    chunks = result.get("retrieved_chunks", [])
+    cited = cited_source_indices(
+        split_sources_footer(result.get("answer", "")), chunks
+    )
+    if not cited:
+        print("no sources cited")
+    for i in cited:
+        chunk = chunks[i - 1]
+        name = display_source_name(chunk.get("source", ""))
+        print(f"\nSOURCE {i}:" + (f" {name}" if name else ""))
+        print(str(chunk.get("text", "")))
