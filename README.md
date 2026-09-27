@@ -1,17 +1,13 @@
 # Agentic RAG System
 
 This repository contains an agentic RAG system built on the frameworks that
-dominate 2026 production RAG: **LlamaIndex** for ingestion/indexing/retrieval, **LangChain** for LLM wrapping and prompt composition,
+dominate production RAG: **LlamaIndex** for ingestion/indexing/retrieval, **LangChain** for LLM wrapping and prompt composition,
 **LangGraph** for the agentic orchestration graph.
 The agentic design routes each query:
 
-- **no_retrieval** → answered directly by the LLM, no documents.
-- **simple** → retrieve → grade → generate. A failed grade re-retrieves up
-  to `MAX_RETRIES` times, then falls back to a partial best-effort answer.
-- **complex** → decompose → retrieve → grade → generate. Same grading gate:
-  each sub-question is retrieved and graded, and a failed grade re-retrieves
-  (re-targeting every sub-question with a wider budget) up to `MAX_RETRIES`
-  times, then falls back to a partial best-effort answer.
+- **No Retrieval**: answered directly by the LLM, no documents.
+- **Simple Retrieval**: retrieve → grade → generate.
+- **Complex Retrieval**: decompose → retrieve → grade → generate.
 
 Both simple and complex routes share the identical `grade` exit: go to
 `generate` when the context is sufficient **or** `retry_count` has reached
@@ -23,6 +19,8 @@ every sub-question is covered).
 The used dataset is the GutenQA dataset. You can download the three required
 files ('GutenQA.parquet', 'gutenqa_chunks.parquet', 'questions.parquet') from
 the HuggingFace repository and insert them into the data folder.
+
+![Demo showing agentic RAG query routing](./assets/Agentic_RAG_System_demo.gif)
 
 ## Architecture
 
