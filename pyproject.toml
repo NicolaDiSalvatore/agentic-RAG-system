@@ -61,6 +61,8 @@ dev = [
     "mypy==1.19.1",
     # Evaluation (src/evaluation/run_eval.py imports it when it runs)
     "ragas==0.3.9",
+    # ragas does not pin this, and importing it fails on newer releases.
+    "langchain-community==0.4",
 ]
 
 [tool.setuptools.packages.find]
