@@ -1,11 +1,9 @@
 """Tests for the evaluation pipeline in src/evaluation/run_eval.py."""
 
-import argparse
 from unittest.mock import MagicMock, patch
 import pytest
 from datasets import Dataset
 from src.evaluation.run_eval import (
-    METRIC_NAMES,
     _parse_args,
     invoke_graph,
     load_gutenqa,
@@ -359,6 +357,9 @@ def test_run_wires_pipeline_components(monkeypatch):
     with (
         patch("ragas.evaluate", evaluate),
         patch("src.graph.build_graph.build_graph", return_value="graph"),
+        # The warm-up opens the real Qdrant index and embedding model; this
+        # test only verifies wiring, so stub it out.
+        patch("src.graph.nodes._get_retriever"),
     ):
         run(limit=1, max_workers=3)
 

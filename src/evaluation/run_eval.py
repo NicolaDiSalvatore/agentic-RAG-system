@@ -86,7 +86,8 @@ def invoke_graph(graph: Any, examples: Dataset, workers: int = 4) -> Dataset:
         for done, future in enumerate(as_completed(futures), start=1):
             index = futures[future]
             future.result()
-            print(f"Ran {done}/{total}: {results[index]['route']}")
+            record = results[index] or {}
+            print(f"Ran {done}/{total}: {record.get('route', 'unknown')}")
 
     records = [record or {} for record in results]
     return Dataset.from_list(records)
@@ -182,7 +183,10 @@ def run(limit: int | None = None, max_workers: int = 4) -> None:
     # threads at once fails with AlreadyLocked; warming up removes the race.
     from src.graph.nodes import _get_retriever
 
-    _get_retriever()
+    from src.config import settings
+
+    roles = [role.strip() for role in settings.auth_roles.split(",") if role.strip()]
+    _get_retriever(settings.auth_tenant_id, roles)
     records = invoke_graph(graph, examples, workers=max_workers)
     routes = [str(row["route"]) for row in records]
     scores = evaluate(

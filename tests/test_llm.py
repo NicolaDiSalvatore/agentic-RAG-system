@@ -2,10 +2,13 @@
 
 from unittest.mock import MagicMock, patch
 from src.llm.langchain_llm import (
+    citation_report,
+    strip_invalid_markers,
     _append_sources,
     _format_context,
     _normalize_output,
     cited_source_indices,
+    validated_citations,
     display_source_name,
     generate_answer,
     generate_partial_answer,
@@ -184,6 +187,13 @@ def test_cited_source_indices_ignores_out_of_range_and_absent_chunks():
     assert cited_source_indices("Claim [SOURCE 1].", []) == []
 
 
+def test_validated_citations_resolves_only_canonical_retrieved_chunks():
+    chunks = [{"text": "a", "source": "book", "source_uri": "docs/book.txt", "document_id": "doc-1", "chunk_id": "doc-1-c-1"}]
+    assert validated_citations("Claim [SOURCE 1] and [SOURCE 9].", chunks) == [
+        {"document_id": "doc-1", "chunk_id": "doc-1-c-1", "source_uri": "docs/book.txt"}
+    ]
+
+
 def test_append_sources_names_cited_book():
     answer = "Fogg lived at Number 7 [SOURCE 1]."
     result = _append_sources(answer, [{"text": "t", "source": FOGG_SLUG}])
@@ -299,3 +309,76 @@ def test_generate_partial_answer_without_plain_text_returns_raw_model_output():
             "where?", [{"text": "t", "source": FOGG_SLUG}]
         )
     assert answer == raw
+
+
+def _chunk(text, chunk_id="c1"):
+    return {
+        "text": text,
+        "source": "book",
+        "source_uri": "book",
+        "document_id": "d1",
+        "chunk_id": chunk_id,
+    }
+
+
+FOGG_CHUNK = _chunk("Phileas Fogg lived at Number 7 Saville Row in London.")
+
+
+def test_citation_report_accepts_a_supported_citation():
+    report = citation_report("Fogg lived at Saville Row in London [SOURCE 1].", [FOGG_CHUNK])
+    assert report.grounded is True
+    assert report.validity == 1.0
+    assert report.markers_total == 1
+    assert report.unsupported_sentences == 0
+
+
+def test_citation_report_counts_what_validated_citations_hides():
+    # The filtered list alone looks perfect here; the report shows the failure.
+    text = "Fogg lived in London [SOURCE 1]. He owned a fleet [SOURCE 9]."
+    report = citation_report(text, [FOGG_CHUNK])
+    assert len(report.citations) == 1
+    assert report.invalid_markers == 1
+    assert report.validity == 0.5
+    assert report.grounded is False
+
+
+def test_citation_report_flags_a_citation_to_an_unrelated_chunk():
+    text = "Zebras migrate across savannah grasslands annually [SOURCE 1]."
+    report = citation_report(text, [FOGG_CHUNK])
+    assert report.citations
+    assert report.unsupported_sentences == 1
+    assert report.grounded is False
+
+
+def test_citation_report_flags_chunks_without_canonical_ids():
+    report = citation_report("Fogg lived in London [SOURCE 1].", [{"text": "Fogg lived in London"}])
+    assert report.non_canonical_markers == 1
+    assert report.grounded is False
+
+
+def test_citation_report_with_no_markers_has_no_validity_and_is_not_grounded():
+    report = citation_report("Fogg lived in London.", [FOGG_CHUNK])
+    assert report.validity is None
+    assert report.uncited_sentences == 1
+    assert report.grounded is False
+
+
+def test_citation_report_ignores_the_footer_numbers():
+    text = "Fogg lived in London [SOURCE 1].\n\nSources:\n  [1] Around the World - Verne"
+    report = citation_report(text, [FOGG_CHUNK])
+    assert report.markers_total == 1
+    assert report.uncited_sentences == 0
+
+
+def test_citation_report_keeps_a_trailing_marker_with_its_sentence():
+    report = citation_report("Fogg lived in London. [SOURCE 1]", [FOGG_CHUNK])
+    assert report.cited_sentences == 1
+    assert report.uncited_sentences == 0
+    assert report.grounded is True
+
+
+def test_strip_invalid_markers_keeps_valid_ones():
+    text = "Fogg lived in London [SOURCE 1] and owned ships [SOURCE 9]."
+    assert strip_invalid_markers(text, [FOGG_CHUNK]) == (
+        "Fogg lived in London [SOURCE 1] and owned ships."
+    )

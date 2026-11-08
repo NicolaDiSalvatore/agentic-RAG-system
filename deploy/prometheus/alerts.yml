@@ -1,0 +1,51 @@
+# These appear on Prometheus's Alerts page. They don't send notifications.
+groups:
+  - name: rag
+    rules:
+      - alert: ApiDown
+        expr: up{job="rag-api"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Prometheus cannot scrape the API.
+
+      - alert: High5xxRate
+        expr: |
+          sum(rate(rag_requests_total{status=~"5.."}[5m]))
+            / sum(rate(rag_requests_total[5m])) > 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: More than 5% of requests are failing.
+
+      - alert: CircuitBreakerOpen
+        expr: max by (provider, model) (rag_circuit_breaker_open) == 1
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.provider }} {{ $labels.model }} is being skipped."
+
+      - alert: ServingExtractiveAnswers
+        expr: sum(rate(rag_answer_status_total{status="extractive"}[10m])) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Answers are quoting passages because no LLM is available.
+
+      - alert: DailyQuotaNearlySpent
+        expr: rag_daily_quota_used{unit="tokens"} > 150000
+        labels: {severity: warning}
+        annotations:
+          summary: Over 150,000 tokens used today, against a default budget of 180,000.
+
+      - alert: InvalidCitations
+        expr: sum(increase(rag_citation_markers_total{result="invalid"}[1h])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: The model emitted citations that resolve to no retrieved chunk.
+
+      - alert: QueriesTimingOut
+        expr: sum(increase(rag_rejected_total{reason="deadline"}[10m])) > 2
+        labels: {severity: warning}
+        annotations:
+          summary: Several queries hit the request deadline.

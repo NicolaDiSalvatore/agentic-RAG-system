@@ -14,3 +14,11 @@ class GraphState(TypedDict):
     retry_count: int
     answer: str
     grade_details: list[dict]
+    tenant_id: str
+    roles: list[str]
+    citations: list[dict]
+    grounded: bool
+    evidence: list[dict]
+    escalated: bool
+    answer_status: str
+    fallback: str | None

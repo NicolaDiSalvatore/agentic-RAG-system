@@ -1,21 +1,42 @@
-"""
-Wrap the hosted LLM using LangChain's ChatGroq + LCEL prompt composition.
-"""
+"""Wrap configured LLM providers using LangChain + LCEL prompt composition."""
 
+import logging
+import random
 import re
 import ssl
 import time
 import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 import httpx
 import truststore
-from groq import RateLimitError
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
+from src import quota
 from src.config import settings
+from src.observability import metrics, tracing
+from src.resilience import (
+    PERMANENT,
+    RATE_LIMITED,
+    TIMEOUT,
+    UNKNOWN,
+    LLMUnavailable,
+    RequestContext,
+    breaker_for,
+    classify_error,
+    current_context,
+)
+from src.schemas import Citation
 
+logger = logging.getLogger("rag.llm")
+
+# Offline tools have no deadline, so they wait out rate limits instead of
+# falling back; a request-scoped call only waits this long before moving on.
 MAX_RATE_LIMIT_RETRIES = 6
+MAX_REQUEST_RATE_LIMIT_WAIT_SECONDS = 2.0
 _RETRY_AFTER_RE = re.compile(r"Please try again in ([\d.]+)s")
 
 _SQUOTE = "'"
@@ -99,95 +120,176 @@ its exact [SOURCE n] label.
 """
 
 
-@lru_cache(maxsize=2)
-def _get_chat_model(model: str) -> ChatGroq:
-    """Build a ChatGroq client for ``model`` once and reuse it.
+@dataclass(frozen=True)
+class LLMTarget:
+    """One provider and model the service can call."""
+
+    provider: str
+    model: str
+
+
+def _primary_target() -> LLMTarget:
+    model = {
+        "groq": settings.groq_model,
+        "openai": settings.openai_model,
+        "ollama": settings.ollama_model,
+    }[settings.llm_provider]
+    return LLMTarget(settings.llm_provider, model)
+
+
+def llm_targets() -> list[LLMTarget]:
+    """Return the configured provider, then each usable fallback, in order.
+
+    A fallback whose provider has no credentials is skipped rather than being
+    tried and failing on every request.
+
+    Returns:
+        The distinct targets to try, always starting with ``LLM_PROVIDER``'s.
+    """
+    targets = [_primary_target()]
+    for entry in settings.llm_fallback_chain.split(","):
+        provider, separator, model = entry.strip().partition(":")
+        if not separator or not model:
+            continue
+        target = LLMTarget(provider.strip().lower(), model.strip())
+        if target.provider not in {"groq", "openai", "ollama"}:
+            logger.warning("Ignoring unknown fallback provider %r.", target.provider)
+            continue
+        if target.provider == "openai" and not settings.openai_api_key:
+            continue
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+
+@lru_cache(maxsize=8)
+def _get_chat_model(provider: str, model: str) -> ChatGroq | ChatOpenAI:
+    """Build a configured chat client for one target once and reuse it.
 
     Windows enterprise proxies often use a root CA that is trusted by the
     operating system but not by certifi, which httpx uses by default, so the
-    client is wired to a truststore-backed SSL context.
+    client is wired to a truststore-backed SSL context. Retries are disabled in
+    the SDKs because ``_invoke_with_fallback`` owns the retry budget.
 
     Args:
-        model: The Groq model identifier to target.
+        provider: The provider adapter to use.
+        model: The model identifier to target.
 
     Returns:
-        A cached ChatGroq client bound to ``model``.
+        A cached provider client bound to ``model``.
     """
-    # Windows enterprise proxies often use a root CA that is trusted by the
-    # operating system but not by certifi, which httpx uses by default.
-    http_client = httpx.Client(
-        verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    timeout = httpx.Timeout(
+        settings.llm_attempt_timeout_seconds, connect=settings.llm_connect_timeout_seconds
     )
+    http_client = httpx.Client(
+        verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), timeout=timeout
+    )
+    if provider in {"openai", "ollama"}:
+        is_ollama = provider == "ollama"
+        return ChatOpenAI(
+            model=model,
+            api_key=("ollama" if is_ollama else settings.openai_api_key),
+            base_url=(settings.ollama_base_url if is_ollama else settings.openai_base_url) or None,
+            temperature=settings.groq_temperature,
+            timeout=timeout,
+            max_retries=0,
+            max_tokens=settings.max_output_tokens,
+            http_client=http_client,
+        )
     return ChatGroq(
         model=model,
+        api_key=settings.groq_api_key or None,
         temperature=settings.groq_temperature,
         model_kwargs={"seed": settings.groq_seed},
+        timeout=timeout,
+        max_retries=0,
+        max_tokens=settings.max_output_tokens,
         http_client=http_client,
     )
 
 
+def get_chat_model() -> ChatGroq | ChatOpenAI:
+    """Return the client for the configured primary provider and model."""
+    target = _primary_target()
+    return _get_chat_model(target.provider, target.model)
+
+
 @lru_cache(maxsize=1)
-def get_chat_model() -> ChatGroq:
-    """Build the production ChatGroq client once per process and reuse it.
+def get_judge_chat_model() -> ChatGroq | ChatOpenAI:
+    """Build the RAGAS judge client once per process and reuse it.
 
     Returns:
-        A cached ChatGroq client using the configured ``groq_model``.
+        A cached client using the configured provider and judge model.
     """
-    return _get_chat_model(settings.groq_model)
+    # The judge uses the selected adapter as well; configure a dedicated Groq
+    # judge only when Groq is the active provider.
+    if settings.llm_provider == "groq":
+        return _get_chat_model("groq", settings.ragas_judge_model)
+    return get_chat_model()
 
 
-@lru_cache(maxsize=1)
-def get_judge_chat_model() -> ChatGroq:
-    """Build the RAGAS judge ChatGroq client once per process and reuse it.
+_RAG_TEMPLATE = ChatPromptTemplate.from_messages([
+    ("system", RAG_SYSTEM_PROMPT),
+    ("human", "Context:\n{context}\n\nQuestion: {question}"),
+])
+
+_PARTIAL_TEMPLATE = ChatPromptTemplate.from_messages([
+    ("system", PARTIAL_ANSWER_SYSTEM_PROMPT.format(extra_instructions="")),
+    ("human", "Context:\n{context}\n\nQuestion: {question}\n\n{note}"),
+])
+
+
+class _PromptedModel:
+    """Fill a prompt, then call the model.
+
+    An LCEL ``template | model`` chain would add a chain entry and a prompt entry
+    to every trace. Calling the model directly leaves one entry per LLM attempt,
+    which still shows the final messages.
+    """
+
+    def __init__(self, template: ChatPromptTemplate, model: Any) -> None:
+        self._template = template
+        self._model = model
+
+    def invoke(self, inputs: dict, config: dict | None = None) -> Any:
+        return self._model.invoke(self._template.format_messages(**inputs), config=config)
+
+
+def build_rag_chain(target: LLMTarget, timeout: float) -> _PromptedModel:
+    """Compose the RAG prompt with one target, limited to ``timeout`` seconds.
+
+    Composition is cheap and the timeout differs per attempt, because each call
+    only gets what is left of the request, so this chain is not cached.
+
+    Args:
+        target: The provider and model to call.
+        timeout: The longest this attempt may take, in seconds.
 
     Returns:
-        A cached ChatGroq client using the configured ``ragas_judge_model``.
+        An object whose ``invoke`` fills the prompt and calls the model.
     """
-    return _get_chat_model(settings.ragas_judge_model)
+    return _PromptedModel(
+        _RAG_TEMPLATE, _get_chat_model(target.provider, target.model).bind(timeout=timeout)
+    )
 
 
-@lru_cache(maxsize=1)
-def build_rag_chain():
-    """Compose prompt | model | parser once per process and reuse it.
-
-    Chains the RAG system prompt and context/question template through the
-    production chat model and a plain string output parser. The result is
-    cached so ``generate_answer`` never recompiles the chain.
-
-    Returns:
-        The composed LCEL chain ``template | chat_model | parser``.
-    """
-
-    template = ChatPromptTemplate.from_messages([
-        ("system", RAG_SYSTEM_PROMPT),
-        ("human", "Context:\n{context}\n\nQuestion: {question}"),
-    ])
-
-    parser = StrOutputParser()
-
-    return template | get_chat_model() | parser
-
-
-@lru_cache(maxsize=1)
-def build_partial_answer_chain():
-    """Compose the partial-answer prompt | model | parser once per process.
+def build_partial_answer_chain(target: LLMTarget, timeout: float) -> _PromptedModel:
+    """Compose the partial-answer prompt with one target.
 
     The chain answers from whatever context is available while explicitly
-    noting gaps, used by ``generate_partial_answer`` when grading judged the
-    retrieved context insufficient. Cached like ``build_rag_chain``.
+    noting gaps, used by ``generate_partial_answer`` when the retrieved context
+    looked insufficient.
+
+    Args:
+        target: The provider and model to call.
+        timeout: The longest this attempt may take, in seconds.
 
     Returns:
-        The composed LCEL chain ``template | chat_model | parser``.
+        An object whose ``invoke`` fills the prompt and calls the model.
     """
-
-    template = ChatPromptTemplate.from_messages([
-        ("system", PARTIAL_ANSWER_SYSTEM_PROMPT.format(extra_instructions="")),
-        ("human", "Context:\n{context}\n\nQuestion: {question}\n\n{note}"),
-    ])
-
-    parser = StrOutputParser()
-
-    return template | get_chat_model() | parser
+    return _PromptedModel(
+        _PARTIAL_TEMPLATE, _get_chat_model(target.provider, target.model).bind(timeout=timeout)
+    )
 
 
 def display_source_name(source: str) -> str:
@@ -323,6 +425,178 @@ def cited_source_indices(text: str, context_chunks: list[dict] | None) -> list[i
     return cited
 
 
+def validated_citations(text: str, context_chunks: list[dict] | None) -> list[dict]:
+    """Return only citations that resolve to retrieved, canonical chunk IDs.
+
+    The model controls only a numeric marker. This function resolves that
+    marker against the exact retrieval result, discarding out-of-range or
+    non-canonical references before they can reach an API client.
+    """
+    citations: list[dict] = []
+    for index in cited_source_indices(split_sources_footer(text), context_chunks):
+        chunk = (context_chunks or [])[index - 1]
+        document_id = chunk.get("document_id")
+        chunk_id = chunk.get("chunk_id")
+        source_uri = chunk.get("source_uri") or chunk.get("source")
+        if document_id and chunk_id and source_uri:
+            citations.append(
+                Citation(
+                    document_id=document_id,
+                    chunk_id=chunk_id,
+                    source_uri=source_uri,
+                ).model_dump()
+            )
+    return citations
+
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset(
+    """a about after all also an and are as at be been but by can could did do does for from
+    had has have he her him his how i if in into is it its may more most no not of on or our
+    she should so some such than that the their them then there these they this those to
+    up was we were what when where which who whom why will with would you your""".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    """Return a text's lower-cased words, minus stopwords and crude plurals."""
+    words = _WORD_RE.findall(unicodedata.normalize("NFKC", text).lower().replace("'s", ""))
+    return {
+        word[:-1] if len(word) > 3 and word.endswith("s") else word
+        for word in words
+        if word not in _STOPWORDS
+    }
+
+
+@dataclass(frozen=True)
+class CitationReport:
+    """How well an answer's citations hold up against the retrieved chunks.
+
+    ``validated_citations`` silently discards bad references, so its result can
+    never show a failure. This report counts them, which is what a metric or a
+    release gate needs. Support is a vocabulary check, not an entailment check:
+    it catches citations pointing at the wrong chunk, not subtle misreadings.
+    """
+
+    citations: list[dict]
+    markers_total: int
+    invalid_markers: int
+    non_canonical_markers: int
+    cited_sentences: int
+    unsupported_sentences: int
+    uncited_sentences: int
+
+    @property
+    def grounded(self) -> bool:
+        """Whether the answer has citations and none of them failed a check."""
+        return bool(
+            self.citations
+            and not self.invalid_markers
+            and not self.non_canonical_markers
+            and not self.unsupported_sentences
+        )
+
+    @property
+    def validity(self) -> float | None:
+        """Share of emitted markers that resolved, or ``None`` with no markers."""
+        if not self.markers_total:
+            return None
+        failed = self.invalid_markers + self.non_canonical_markers
+        return (self.markers_total - failed) / self.markers_total
+
+
+def _split_sentences(body: str) -> list[str]:
+    """Split text into sentences, keeping a trailing marker with its sentence."""
+    sentences: list[str] = []
+    for piece in _SENTENCE_RE.split(body):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if sentences and not _CITATION_RE.sub("", piece).strip(" .,;:"):
+            sentences[-1] = f"{sentences[-1]} {piece}"
+        else:
+            sentences.append(piece)
+    return sentences
+
+
+def citation_report(text: str, context_chunks: list[dict] | None) -> CitationReport:
+    """Check every citation marker in an answer against the retrieved chunks.
+
+    Args:
+        text: A finalized answer, with or without its sources footer.
+        context_chunks: The chunks the answer was generated from.
+
+    Returns:
+        The counts for this answer, plus its resolved citations.
+    """
+    chunks = context_chunks or []
+    body = split_sources_footer(text)
+    markers = [int(match.group(1)) for match in _CITATION_RE.finditer(body)]
+    invalid = sum(1 for index in markers if not 1 <= index <= len(chunks))
+
+    def canonical(index: int) -> bool:
+        chunk = chunks[index - 1]
+        return bool(
+            chunk.get("document_id")
+            and chunk.get("chunk_id")
+            and (chunk.get("source_uri") or chunk.get("source"))
+        )
+
+    non_canonical = sum(
+        1 for index in markers if 1 <= index <= len(chunks) and not canonical(index)
+    )
+
+    cited_sentences = unsupported = uncited = 0
+    for sentence in _split_sentences(body):
+        indices = {int(match.group(1)) for match in _CITATION_RE.finditer(sentence)}
+        words = _content_words(_CITATION_RE.sub(" ", sentence))
+        if not indices:
+            uncited += 1 if words else 0
+            continue
+        cited_sentences += 1
+        valid = [index for index in indices if 1 <= index <= len(chunks)]
+        if not words or not valid:
+            continue
+        evidence: set[str] = set()
+        for index in valid:
+            evidence |= _content_words(chunks[index - 1].get("text", ""))
+        if len(words & evidence) / len(words) < settings.citation_min_support:
+            unsupported += 1
+
+    return CitationReport(
+        citations=validated_citations(text, chunks),
+        markers_total=len(markers),
+        invalid_markers=invalid,
+        non_canonical_markers=non_canonical,
+        cited_sentences=cited_sentences,
+        unsupported_sentences=unsupported,
+        uncited_sentences=uncited,
+    )
+
+
+def strip_invalid_markers(text: str, context_chunks: list[dict] | None) -> str:
+    """Remove citation markers that point at no retrieved chunk.
+
+    A reader cannot tell a fabricated ``[SOURCE 9]`` from a real one, so it must
+    not be displayed even though the report has already counted it.
+
+    Args:
+        text: A finalized answer.
+        context_chunks: The chunks the answer was generated from.
+
+    Returns:
+        The answer with out-of-range markers and the space before them removed.
+    """
+    limit = len(context_chunks or [])
+
+    def keep_valid(match: re.Match) -> str:
+        return match.group(0) if 1 <= int(match.group(2)) <= limit else ""
+
+    pattern = re.compile(r"(\s*)\[?\s*SOURCE\s*#?\s*(\d+)\s*\]?", re.IGNORECASE)
+    return pattern.sub(keep_valid, text)
+
+
 def _append_sources(text: str, context_chunks: list[dict] | None) -> str:
     """Append a ``Sources:`` footer naming every book the answer cites.
 
@@ -372,12 +646,10 @@ def _append_sources(text: str, context_chunks: list[dict] | None) -> str:
 def _finalize(text: str, context_chunks: list[dict] | None, plain_text: bool) -> str:
     """Normalize and attribute ``text``, but only when the caller opts in.
 
-    ``generate_answer`` doubles as the router, the question decomposer and the
-    sufficiency grader, and those callers depend on parsing the raw string
-    (``route_node`` matches a single token, ``decompose_node`` splits on
-    newlines, ``_ask_yes_no`` checks for a leading ``YES``). Stripping Markdown
-    from their output would couple them to presentation changes, so the
-    transformation is opt-in and only the answer nodes ask for it.
+    ``generate_answer`` doubles as the question decomposer, which parses the raw
+    string (``decompose_node`` splits on newlines). Stripping Markdown from its
+    output would couple it to presentation changes, so the transformation is
+    opt-in and only the answer nodes ask for it.
 
     Args:
         text: The raw model answer.
@@ -420,32 +692,145 @@ def _format_context(context_chunks: list[dict] | None) -> str:
     return "\n\n".join(blocks)
 
 
-def _invoke_with_retry(chain, inputs: dict) -> str:
-    """Invoke ``chain`` with ``inputs``, backing off on Groq rate limits.
+def _message_text(result: Any) -> str:
+    """Return the text of a chain result, which is a chat message or a string."""
+    if isinstance(result, str):
+        return result
+    content = getattr(result, "content", "")
+    return content if isinstance(content, str) else str(content)
 
-    Groq's on-demand tier throttles by tokens per minute; concurrent eval
-    workers routinely burst past it. Retry with backoff, honoring the
-    retry_after hint Groq reports in the 429 message, instead of crashing.
+
+def _record_success(
+    target: LLMTarget, role: str, result: Any, started: float, context: RequestContext | None
+) -> None:
+    """Record a successful call's latency and token use everywhere it is tracked."""
+    usage = getattr(result, "usage_metadata", None)
+    usage = usage if isinstance(usage, dict) else {}
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    labels = {"provider": target.provider, "model": target.model}
+    metrics.LLM_CALLS.labels(**labels, role=role, status="ok").inc()
+    metrics.LLM_SECONDS.labels(**labels).observe(time.monotonic() - started)
+    metrics.LLM_TOKENS.labels(**labels, direction="input").inc(input_tokens)
+    metrics.LLM_TOKENS.labels(**labels, direction="output").inc(output_tokens)
+    quota.record(input_tokens + output_tokens)
+    spent = quota.usage()
+    metrics.QUOTA_USED.labels(unit="tokens").set(spent["tokens"])
+    metrics.QUOTA_USED.labels(unit="requests").set(spent["requests"])
+    if context is not None:
+        context.input_tokens += input_tokens
+        context.output_tokens += output_tokens
+        context.models_used.append(f"{target.provider}:{target.model}")
+
+
+def _attempt_timeout(context: RequestContext | None) -> float:
+    """Return this attempt's time limit, raising when too little time is left."""
+    remaining = context.remaining() if context is not None else None
+    if remaining is None:
+        return settings.llm_attempt_timeout_seconds
+    if remaining < settings.llm_min_call_seconds:
+        raise LLMUnavailable("deadline")
+    return min(settings.llm_attempt_timeout_seconds, remaining)
+
+
+def _invoke_with_fallback(
+    build_chain: Callable[[LLMTarget, float], Any], inputs: dict, role: str
+) -> str:
+    """Call providers in order until one answers or the request's limits run out.
+
+    Timeouts move straight to the next target, because waiting for one provider
+    twice would spend the whole request and leave nothing for the fallback.
+    Other transient errors get a bounded retry with backoff and jitter. Each
+    attempt counts against the request's call budget and the daily quota.
 
     Args:
-        chain: The LCEL chain to invoke.
+        build_chain: Builds the chain for a target and an attempt timeout.
         inputs: The chain's input dict.
+        role: What the call is for, used as a metrics label.
 
     Returns:
         The model's string answer.
 
     Raises:
-        RateLimitError: If all ``MAX_RATE_LIMIT_RETRIES`` attempts are
-            exhausted without a successful response.
+        LLMUnavailable: When no provider could answer within the limits.
     """
-    for attempt in range(MAX_RATE_LIMIT_RETRIES):
-        try:
-            return chain.invoke(inputs)
-        except RateLimitError as exc:
-            if attempt == MAX_RATE_LIMIT_RETRIES - 1:
-                raise
-            wait = _retry_after_seconds(exc) or (2.0 * (attempt + 1))
-            time.sleep(wait)
+    context = current_context()
+    max_attempts = (
+        MAX_RATE_LIMIT_RETRIES if context is None else settings.llm_max_attempts_per_provider
+    )
+    config = {"callbacks": tracing.callbacks(), "run_name": role}
+    for target in llm_targets():
+        labels = {"provider": target.provider, "model": target.model}
+        breaker = breaker_for(
+            target.provider,
+            target.model,
+            settings.breaker_failure_threshold,
+            settings.breaker_reset_seconds,
+        )
+        for attempt in range(max_attempts):
+            if not breaker.allow():
+                metrics.LLM_CALLS.labels(**labels, role=role, status="breaker_open").inc()
+                break
+            if context is not None and context.budget_exhausted():
+                raise LLMUnavailable("call_budget")
+            if quota.exhausted():
+                metrics.QUOTA_EXHAUSTED.inc()
+                raise LLMUnavailable("daily_quota")
+            timeout = _attempt_timeout(context)
+            if context is not None:
+                context.llm_calls += 1
+            started = time.monotonic()
+            try:
+                result = build_chain(target, timeout).invoke(inputs, config=config)
+            except Exception as exc:
+                kind = classify_error(exc)
+                if kind == UNKNOWN:
+                    raise
+                metrics.LLM_CALLS.labels(**labels, role=role, status=kind).inc()
+                logger.warning(
+                    "LLM call failed: %s %s role=%s kind=%s error=%s",
+                    target.provider, target.model, role, kind, type(exc).__name__,
+                )
+                wait = None if attempt == max_attempts - 1 else _retry_delay(
+                    kind, exc, attempt, context
+                )
+                if wait is None:
+                    if kind == RATE_LIMITED:
+                        hint = _retry_after_seconds(exc)
+                        breaker.open_for(hint if hint else settings.breaker_reset_seconds)
+                    else:
+                        breaker.record_failure()
+                    break
+                breaker.record_failure()
+                time.sleep(wait)
+            else:
+                breaker.record_success()
+                _record_success(target, role, result, started, context)
+                return _message_text(result)
+            finally:
+                metrics.BREAKER_STATE.labels(**labels).set(
+                    0 if breaker.state == breaker.CLOSED else 1
+                )
+    raise LLMUnavailable("all_providers_failed")
+
+
+def _retry_delay(
+    kind: str, exc: Exception, attempt: int, context: RequestContext | None
+) -> float | None:
+    """Return how long to wait before retrying a target, or ``None`` to move on."""
+    if kind in {TIMEOUT, PERMANENT}:
+        return None
+    hint = _retry_after_seconds(exc)
+    delay = hint if hint is not None else (2.0 * (attempt + 1)) * random.uniform(0.5, 1.0)
+    if context is None:
+        return delay
+    if kind == RATE_LIMITED and delay > MAX_REQUEST_RATE_LIMIT_WAIT_SECONDS:
+        return None
+    delay = min(delay, MAX_REQUEST_RATE_LIMIT_WAIT_SECONDS)
+    remaining = context.remaining()
+    if remaining is not None and remaining - delay < settings.llm_min_call_seconds:
+        return None
+    return delay
 
 
 def generate_answer(
@@ -453,6 +838,7 @@ def generate_answer(
     context_chunks: list[dict] | None,
     *,
     plain_text: bool = False,
+    role: str = "generate",
 ) -> str:
     """Generate an answer to ``question`` using the composed RAG chain.
 
@@ -462,18 +848,17 @@ def generate_answer(
             block. ``None`` renders an empty context.
         plain_text: Set by the answer nodes to normalize the answer to plain
             text and append a footer naming the cited sources. Left off by the
-            router, decomposer and grader callers, which parse the raw output.
+            decomposer, which parses the raw output.
+        role: What the call is for, used as a metrics label.
 
     Returns:
         The model's string answer.
 
     Raises:
-        RateLimitError: If all ``MAX_RATE_LIMIT_RETRIES`` attempts are
-            exhausted without a successful response.
+        LLMUnavailable: If no provider could answer within the request's limits.
     """
-    chain = build_rag_chain()
     inputs = {"context": _format_context(context_chunks), "question": question}
-    raw = _invoke_with_retry(chain, inputs)
+    raw = _invoke_with_fallback(lambda t, to: build_rag_chain(t, to), inputs, role)
     return _finalize(raw, context_chunks, plain_text)
 
 
@@ -504,10 +889,8 @@ def generate_partial_answer(
         The model's string answer.
 
     Raises:
-        RateLimitError: If all ``MAX_RATE_LIMIT_RETRIES`` attempts are
-            exhausted without a successful response.
+        LLMUnavailable: If no provider could answer within the request's limits.
     """
-    chain = build_partial_answer_chain()
     note = ""
     if gaps:
         joined = "\n".join(f"- {gap}" for gap in gaps)
@@ -521,20 +904,27 @@ def generate_partial_answer(
         "question": question,
         "note": note,
     }
-    raw = _invoke_with_retry(chain, inputs)
+    raw = _invoke_with_fallback(lambda t, to: build_partial_answer_chain(t, to), inputs, "partial")
     return _finalize(raw, context_chunks, plain_text)
 
 
-def _retry_after_seconds(exc: RateLimitError) -> float | None:
+def _retry_after_seconds(exc: Exception) -> float | None:
     """Extract the ``retry in Xs`` hint from a Groq 429 message, if present.
 
     Args:
-        exc: The raised rate-limit error whose body may carry the hint.
+        exc: The raised rate-limit exception whose body or headers may carry a hint.
 
     Returns:
         The suggested wait time in seconds that Groq reported, or ``None``
             when the message carries no parseable hint.
     """
+    response = getattr(exc, "response", None)
+    retry_after = getattr(response, "headers", {}).get("retry-after") if response else None
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
     match = _RETRY_AFTER_RE.search(str(getattr(exc, "body", "") or exc))
     if match:
         return float(match.group(1))

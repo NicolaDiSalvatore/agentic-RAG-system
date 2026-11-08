@@ -2,14 +2,16 @@
 .opencode
 Users
 .env
-PE.md
-FI.md
-ri.txt
+*.txt
+*.md
+!README.md
+!docs/running.md
 __pycache__/
 .idea
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 data/*
 !data/.gitkeep
-
 # scratch / demo artifacts
 demo.cast
-requirements2.txt

@@ -8,7 +8,8 @@ import hashlib
 import json
 import os
 import pickle
-import shutil
+import uuid
+from datetime import UTC, datetime
 from datasets import load_dataset
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.llms import MockLLM
@@ -18,22 +19,24 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from diskcache import Cache
 from src.config import settings, get_embed_model
+from src.schemas import IndexedChunk
 from tqdm import tqdm
-from src.config import get_embed_model
 
 
 PROJECT_ROOT = Path(__file__).parents[2]
 QDRANT_PATH = PROJECT_ROOT / ".cache" / "qdrant"
-NODE_CACHE_PATH = PROJECT_ROOT / ".cache" / "corpus_nodes.pkl"
+NODE_CACHE_ROOT = PROJECT_ROOT / ".cache" / "corpus_nodes"
 EMBED_CACHE_ROOT = PROJECT_ROOT / ".cache" / "corpus_embeddings"
+MANIFEST_ROOT = PROJECT_ROOT / ".cache" / "manifests"
 COLLECTION_NAME = "rag_system"
 
-EMBED_BATCH_SIZE = 128
+EMBED_BATCH_SIZE = 64
 INSERT_CHUNK_SIZE = 2048
 
 _cached_index: VectorStoreIndex | None = None
 _cached_nodes: list[TextNode] | None = None
 _embed_cache: "Cache | None" = None
+_manifest_cache: dict | None = None
 
 
 def _collection_name() -> str:
@@ -46,7 +49,9 @@ def _collection_name() -> str:
     Returns:
         The Qdrant collection name to read from and write to.
     """
-    return settings.qdrant_collection or COLLECTION_NAME
+    base = settings.qdrant_collection or COLLECTION_NAME
+    suffix = f"__{settings.index_version}"
+    return base if base.endswith(suffix) else f"{base}{suffix}"
 
 
 def _open_client() -> QdrantClient:
@@ -98,9 +103,13 @@ def _content_key(text: str, metadata: dict) -> str:
     Returns:
         A SHA-256 hex digest of the canonicalized text/metadata payload.
     """
+    # Keep the identity compatible with the original ingestion format. New
+    # governance metadata (tenant, ACL, versions, and the derived chunk ID)
+    # must not create duplicate vectors for an otherwise unchanged chunk.
     meta = {
         str(k): (str(v) if v is not None else None)
         for k, v in sorted(metadata.items(), key=lambda pair: str(pair[0]))
+        if str(k) in {"file_name", "chapter"}
     }
     payload = json.dumps(
         {"text": text, "metadata": meta},
@@ -111,6 +120,11 @@ def _content_key(text: str, metadata: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _point_id(content_key: str) -> str:
+    """Derive a stable Qdrant point ID, which must be a UUID, from a content hash."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"rag-chunk:{content_key}"))
+
+
 def _build_nodes(source_path: Path) -> list[TextNode]:
     """Build TextNodes from the pre-chunked parquet file.
 
@@ -118,7 +132,7 @@ def _build_nodes(source_path: Path) -> list[TextNode]:
         source_path: Path to the chunked parquet source file.
 
     Returns:
-        A list of TextNodes with node_id set to the content hash so
+        A list of TextNodes whose ``chunk_id`` metadata is the content hash, so
         incremental builds can detect and reuse already-indexed chunks.
 
     Raises:
@@ -132,17 +146,119 @@ def _build_nodes(source_path: Path) -> list[TextNode]:
         raise ValueError(f"Chunk data is missing required columns: {sorted(missing_columns)}")
     # The parquet file is already chunked. Construct nodes directly so
     # VectorStoreIndex embeds them in batches instead of transforming and
-    # embedding each Document independently. node_id is the content hash so
+    # embedding each Document independently. chunk_id is the content hash so
     # incremental builds can detect and reuse already-indexed chunks.
     nodes = []
     for row in dataset:
         text = str(row["Chunk"] or "")
         if not text.strip():
             continue
-        metadata = {"file_name": row["Book Name"], "chapter": row["Chapter"]}
-        node_id = _content_key(text, metadata)
-        nodes.append(TextNode(text=text, metadata=metadata, node_id=node_id))
+        source_uri = str(row["Book Name"])
+        chapter = str(row["Chapter"])
+        document_id = hashlib.sha256(source_uri.encode("utf-8")).hexdigest()[:24]
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        # The legacy identity fields stay part of the hash so existing
+        # embeddings remain reusable; governance metadata is derived, not hashed.
+        content_key = _content_key(text, {"file_name": source_uri, "chapter": chapter})
+        chunk = IndexedChunk(
+            document_id=document_id,
+            chunk_id=content_key,
+            text=text,
+            section=chapter,
+            source_uri=source_uri,
+            tenant_id="tenant-demo",
+            allowed_roles=["public"],
+            content_hash=f"sha256:{text_hash}",
+            index_version=settings.index_version,
+        )
+        metadata = chunk.model_dump(exclude={"text"})
+        # Keep the original field names the retriever and prompts already use.
+        metadata["file_name"] = source_uri
+        metadata["chapter"] = chapter
+        # ``node_id`` is a read-only property; the constructor kwarg is ``id_``.
+        nodes.append(TextNode(text=text, metadata=metadata, id_=_point_id(content_key)))
     return nodes
+
+
+def _manifest_path(collection: str | None = None) -> Path:
+    """Return the manifest path for a collection (defaults to the active one)."""
+    return MANIFEST_ROOT / f"{collection or _collection_name()}.json"
+
+
+def read_manifest(collection: str | None = None) -> dict | None:
+    """Read the ingestion manifest, returning ``None`` when it is absent.
+
+    The manifest is the only record of which embedding model and index version
+    produced a collection, so callers use it to fail closed when serving an
+    index that does not match the current configuration.
+    """
+    global _manifest_cache
+    name = collection or _collection_name()
+    if _manifest_cache is not None and _manifest_cache.get("collection_name") == name:
+        return _manifest_cache
+    try:
+        manifest = json.loads(_manifest_path(name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    _manifest_cache = manifest
+    return manifest
+
+
+def _manifest_error(manifest: dict | None) -> str | None:
+    """Return why ``manifest`` cannot serve the current settings, if it cannot."""
+    if manifest is None:
+        return (
+            "No ingestion manifest was found for this collection. "
+            "Run `python -m scripts.ingest --path data/gutenqa_chunks.parquet` first."
+        )
+    if manifest.get("collection_name") != _collection_name():
+        return (
+            f"Manifest collection '{manifest.get('collection_name')}' does not match "
+            f"the configured collection '{_collection_name()}'."
+        )
+    if manifest.get("embedding_model") != settings.embedding_model:
+        return (
+            "The index was built with embedding model "
+            f"'{manifest.get('embedding_model')}' but EMBEDDING_MODEL is "
+            f"'{settings.embedding_model}'. Re-ingest under a new INDEX_VERSION."
+        )
+    if manifest.get("index_version") != settings.index_version:
+        return (
+            f"The index version '{manifest.get('index_version')}' does not match "
+            f"INDEX_VERSION '{settings.index_version}'."
+        )
+    if not manifest.get("point_count"):
+        return "The ingestion manifest records no indexed points."
+    return None
+
+
+def active_index_version() -> str:
+    """Return the index version recorded by the manifest, or the configured one."""
+    manifest = read_manifest()
+    if manifest and manifest.get("index_version"):
+        return str(manifest["index_version"])
+    return settings.index_version
+
+
+def _write_manifest(source_path: Path, point_count: int) -> None:
+    """Persist a local, auditable record of a completed ingestion run."""
+    global _manifest_cache
+    MANIFEST_ROOT.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "source_revision": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "parser_version": "parquet-gutenqa-v1",
+        "chunker_version": "upstream-prechunked-v1",
+        "embedding_model": settings.embedding_model,
+        "collection_name": _collection_name(),
+        "index_version": settings.index_version,
+        "point_count": point_count,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    target = _manifest_path()
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, target)
+    _manifest_cache = manifest
 
 
 def _get_embed_cache() -> "Cache":
@@ -162,7 +278,7 @@ def _get_embed_cache() -> "Cache":
     return _embed_cache
 
 
-def _embed_nodes(nodes: list[TextNode], batch_size: int = EMBED_BATCH_SIZE) -> None:
+def _embed_nodes(nodes: list[TextNode], batch_size: int | None = None) -> None:
     """Embed nodes in batches, persisting vectors to the disk cache.
 
     Fills ``node.embedding`` for every node, preferring the cached vector
@@ -179,22 +295,23 @@ def _embed_nodes(nodes: list[TextNode], batch_size: int = EMBED_BATCH_SIZE) -> N
     """
     if not nodes:
         return
+    batch_size = batch_size or settings.embedding_batch_size or EMBED_BATCH_SIZE
 
     embedder = get_embed_model()
     cache = _get_embed_cache()
 
-    missed = [node for node in nodes if node.node_id not in cache]
+    missed = [node for node in nodes if node.metadata["chunk_id"] not in cache]
     with tqdm(total=len(nodes), desc="Embedding", unit="chunk") as pbar:
         for start in range(0, len(missed), batch_size):
             batch = missed[start : start + batch_size]
             vectors = embedder._embed([node.text for node in batch])
             for node, vector in zip(batch, vectors):
                 node.embedding = vector
-                cache[node.node_id] = vector
+                cache[node.metadata["chunk_id"]] = vector
             pbar.update(len(batch))
         for node in nodes:
             if node.embedding is None:
-                node.embedding = cache[node.node_id]
+                node.embedding = cache[node.metadata["chunk_id"]]
         pbar.close()
 
 
@@ -269,29 +386,63 @@ def _existing_content_keys(vector_store: QdrantVectorStore) -> set[str]:
     return keys
 
 
-def _load_node_cache(expected_count: int) -> list[TextNode] | None:
-    """Load pickled corpus nodes when they match the current point count.
+def _node_cache_path(collection: str | None = None) -> Path:
+    """Return the BM25 node cache file for a collection."""
+    return NODE_CACHE_ROOT / f"{collection or _collection_name()}.pkl"
+
+
+def _node_cache_identity(point_count: int) -> dict:
+    """Describe the exact index a node cache must belong to.
+
+    A point count alone cannot identify a corpus: two index versions, or the
+    same corpus before and after a metadata change, can hold identical counts.
+    Reusing nodes from the wrong one would serve stale text to BM25, or drop
+    everything at the tenant filter when the old nodes lack governance metadata.
 
     Args:
-        expected_count: The number of points currently in the collection;
-            a mismatched count invalidates the cache.
+        point_count: The number of points currently in the collection.
 
     Returns:
-        The cached node list if a valid cache exists, otherwise ``None``.
+        The values that must all match for a cached node list to be reused.
     """
-    if not NODE_CACHE_PATH.is_file():
+    manifest = read_manifest() or {}
+    return {
+        "collection_name": _collection_name(),
+        "index_version": settings.index_version,
+        "embedding_model": settings.embedding_model,
+        "source_revision": manifest.get("source_revision"),
+        "parser_version": manifest.get("parser_version"),
+        "chunker_version": manifest.get("chunker_version"),
+        "point_count": point_count,
+    }
+
+
+def _load_node_cache(identity: dict) -> list[TextNode] | None:
+    """Load pickled corpus nodes when they belong to exactly this index.
+
+    Args:
+        identity: The expected value of ``_node_cache_identity``.
+
+    Returns:
+        The cached node list if a matching cache exists, otherwise ``None``.
+    """
+    path = _node_cache_path(identity["collection_name"])
+    if not path.is_file():
         return None
     try:
-        with NODE_CACHE_PATH.open("rb") as handle:
+        with path.open("rb") as handle:
             cached = pickle.load(handle)
     except Exception:
         return None
-    if not isinstance(cached, list) or len(cached) != expected_count:
+    if not isinstance(cached, dict) or cached.get("identity") != identity:
         return None
-    return cached
+    nodes = cached.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) != identity["point_count"]:
+        return None
+    return nodes
 
 
-def _save_node_cache(nodes: list[TextNode]) -> None:
+def _save_node_cache(nodes: list[TextNode], identity: dict) -> None:
     """Persist corpus nodes so later runs skip the Qdrant payload scroll.
 
     Writes atomically via a temporary file so a crash mid-write never leaves
@@ -299,16 +450,22 @@ def _save_node_cache(nodes: list[TextNode]) -> None:
 
     Args:
         nodes: The corpus nodes to persist.
+        identity: The value of ``_node_cache_identity`` the nodes belong to.
 
     Returns:
         None.
     """
-    NODE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = NODE_CACHE_PATH.with_suffix(".tmp")
+    path = _node_cache_path(identity["collection_name"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
     try:
         with tmp_path.open("wb") as handle:
-            pickle.dump(nodes, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_path, NODE_CACHE_PATH)
+            pickle.dump(
+                {"identity": identity, "nodes": nodes},
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        os.replace(tmp_path, path)
     except OSError:
         tmp_path.unlink(missing_ok=True)
 
@@ -318,7 +475,7 @@ def load_corpus_nodes(index: VectorStoreIndex) -> list[TextNode]:
 
     Qdrant keeps node text in its payloads and leaves the index docstore
     empty, so BM25 needs this scroll-based reconstruction instead of
-    ``index.docstore.docs``. A pickle cache keyed by point count avoids
+    ``index.docstore.docs``. A pickle cache tied to the index's identity avoids
     rescrolling every payload on each process start.
 
     Args:
@@ -326,7 +483,7 @@ def load_corpus_nodes(index: VectorStoreIndex) -> list[TextNode]:
 
     Returns:
         The list of all TextNodes stored in the collection, loaded from the
-            pickle cache when it matches the current point count.
+            pickle cache when it belongs to this exact index.
     """
     global _cached_nodes
     if _cached_nodes is not None:
@@ -336,12 +493,13 @@ def load_corpus_nodes(index: VectorStoreIndex) -> list[TextNode]:
     collection = _collection_name()
     expected_count = client.count(collection_name=collection, exact=True).count
 
-    cached = _load_node_cache(expected_count)
+    identity = _node_cache_identity(expected_count)
+    cached = _load_node_cache(identity)
     if cached is not None:
         _cached_nodes = cached
         return _cached_nodes
 
-    nodes = []
+    nodes: list[TextNode] = []
     offset = None
     while True:
         points, offset = client.scroll(
@@ -356,7 +514,7 @@ def load_corpus_nodes(index: VectorStoreIndex) -> list[TextNode]:
             break
 
     if len(nodes) == expected_count:
-        _save_node_cache(nodes)
+        _save_node_cache(nodes, identity)
     _cached_nodes = nodes
     return _cached_nodes
 
@@ -382,13 +540,13 @@ def fill_index(source_path: str, expected_count: int | None = None) -> VectorSto
         AssertionError: If ``expected_count`` is given and does not match the
             final collection point count.
     """
-    global _cached_index
+    global _cached_index, _cached_nodes
     if _cached_index is not None:
         return _cached_index
 
-    source_path = Path(source_path)
-    if not source_path.is_file():
-        raise FileNotFoundError(f"Chunk data file not found: {source_path}")
+    source = Path(source_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Chunk data file not found: {source}")
 
     _configure_embed_model()
     vector_store = _ensure_collection()
@@ -396,8 +554,8 @@ def fill_index(source_path: str, expected_count: int | None = None) -> VectorSto
     existing_count = vector_store.client.count(collection_name=collection, exact=True).count
     existing_keys = _existing_content_keys(vector_store) if existing_count else set()
 
-    nodes = _build_nodes(source_path)
-    missing = [node for node in nodes if node.node_id not in existing_keys]
+    nodes = _build_nodes(source)
+    missing = [node for node in nodes if node.metadata["chunk_id"] not in existing_keys]
     if missing:
         _embed_nodes(missing)
         _insert_missing(vector_store, missing)
@@ -410,18 +568,19 @@ def fill_index(source_path: str, expected_count: int | None = None) -> VectorSto
             f"Collection has {final_count} points, expected {expected_count}; "
             f"{len(missing)} chunks were missing and newly embedded."
         )
+    _write_manifest(source, final_count)
+    _cached_nodes = None
     _cached_index = VectorStoreIndex.from_vector_store(vector_store)
     return _cached_index
 
 
 def build_index(path: str) -> VectorStoreIndex:
-    """Build or reuse the Qdrant index for the given corpus.
+    """Build the configured collection from the corpus, resuming if interrupted.
 
-    Prefers the existing collection when it already has points rather than
-    wiping and re-embedding the corpus (a full embed is a costly CPU-only
-    operation). The local storage folder is only wiped when the collection is
-    missing or empty, because QdrantLocal's delete_collection leaves stale
-    points in its in-memory cache; a remote server collection is never wiped.
+    This delegates to the incremental ``fill_index`` for both storage modes. A
+    partial collection is finished rather than accepted, and only the
+    configured collection is touched: other index versions stay available so
+    switching ``INDEX_VERSION`` back remains a working rollback.
 
     Args:
         path: Path to the chunked parquet source file.
@@ -433,55 +592,67 @@ def build_index(path: str) -> VectorStoreIndex:
     Raises:
         FileNotFoundError: If ``path`` does not exist.
     """
+    return fill_index(path)
+
+
+def load_existing_index() -> VectorStoreIndex:
+    """Open a non-empty persisted collection without indexing documents."""
     global _cached_index
     if _cached_index is not None:
         return _cached_index
 
-    source_path = Path(path)
-    if not source_path.is_file():
-        raise FileNotFoundError(f"Chunk data file not found: {source_path}")
-
-    # Both paths need the embed model: rebuilds embed the corpus, and the
-    # fast path embeds queries at retrieval time.
     _configure_embed_model()
-
+    client = _open_client()
     collection = _collection_name()
-
-    if settings.qdrant_url:
-        client = _open_client()
-        if client.collection_exists(collection):
-            qdrant_count = client.count(collection_name=collection, exact=True).count
-            # Load whatever exists rather than wiping and re-embedding on a
-            # count mismatch: a partial collection is still usable, and the
-            # full corpus embed is a costly CPU-only operation.
-            if qdrant_count > 0:
-                vector_store = QdrantVectorStore(client=client, collection_name=collection)
-                _cached_index = VectorStoreIndex.from_vector_store(vector_store)
-                return _cached_index
+    if not client.collection_exists(collection):
         client.close()
-        # Remote server storage has no QdrantLocal in-memory-cache caveat: a
-        # missing or empty collection is safely created and filled in place.
-        return fill_index(str(source_path))
-
-    if QDRANT_PATH.exists():
-        client = _open_client()
-        if client.collection_exists(collection):
-            qdrant_count = client.count(collection_name=collection, exact=True).count
-            # Load whatever exists rather than wiping and re-embedding on a
-            # count mismatch: a partial collection is still usable, and the
-            # full corpus embed is a costly CPU-only operation. The storage
-            # folder is only wiped when the collection is missing or empty.
-            if qdrant_count > 0:
-                vector_store = QdrantVectorStore(client=client, collection_name=collection)
-                _cached_index = VectorStoreIndex.from_vector_store(vector_store)
-                return _cached_index
+        raise RuntimeError(
+            f"Qdrant collection '{collection}' does not exist. "
+            "Run `python -m scripts.ingest --path data/gutenqa_chunks.parquet` first."
+        )
+    count = client.count(collection_name=collection, exact=True).count
+    if count < 1:
         client.close()
-        # QdrantLocal's delete_collection leaves stale points in its in-memory
-        # cache, so a same-name recreate resurrects old vectors; wiping the
-        # storage folder is the only clean reset for local mode.
-        shutil.rmtree(QDRANT_PATH)
+        raise RuntimeError(
+            f"Qdrant collection '{collection}' is empty. Run ingestion before starting the API."
+        )
+    problem = _manifest_error(read_manifest())
+    if problem:
+        client.close()
+        raise RuntimeError(problem)
+    vector_store = QdrantVectorStore(client=client, collection_name=collection)
+    _cached_index = VectorStoreIndex.from_vector_store(vector_store)
+    return _cached_index
 
-    return fill_index(str(source_path))
+
+def index_is_ready() -> bool:
+    """Return whether the configured collection is trustworthy and has data.
+
+    Readiness must never raise and must never block: in embedded local mode,
+    opening a Qdrant client loads the whole collection (tens of seconds for a
+    large corpus) and takes the storage lock, so the probe inspects the
+    manifest and the collection's on-disk storage instead. Remote mode counts
+    points over the network.
+    """
+    if _manifest_error(read_manifest()) is not None:
+        return False
+    try:
+        if _cached_index is not None:
+            client = _cached_index.vector_store.client
+            return client.count(collection_name=_collection_name(), exact=True).count > 0
+        if not settings.qdrant_url:
+            storage = QDRANT_PATH / "collection" / _collection_name() / "storage.sqlite"
+            return storage.is_file() and storage.stat().st_size > 0
+        client = _open_client()
+        try:
+            collection = _collection_name()
+            return client.collection_exists(collection) and (
+                client.count(collection_name=collection, exact=True).count > 0
+            )
+        finally:
+            client.close()
+    except Exception:
+        return False
 
 
 def close_index() -> None:
