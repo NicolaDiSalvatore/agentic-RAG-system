@@ -16,4 +16,8 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check src tests
       - run: mypy src
-      - run: pytest -q
+      - run: |
+          set -o pipefail
+          pytest -q --tb=short -rfE | tee pytest.log || status=$?
+          grep -E '^(FAILED|ERROR) ' pytest.log | sed 's/^/::error::/' || true
+          exit ${status:-0}
