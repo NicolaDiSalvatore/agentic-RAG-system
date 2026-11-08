@@ -1,4 +1,5 @@
 import argparse
+
 from src.indexing.build_index import build_index
 
 if __name__ == "__main__":

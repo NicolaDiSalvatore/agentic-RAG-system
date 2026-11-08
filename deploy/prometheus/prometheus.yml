@@ -1,0 +1,16 @@
+# Local Prometheus for a laptop: scrapes the API running on this machine.
+# If you set REQUIRE_AUTH=true, add this under the job, with your key in that file:
+#   authorization:
+#     credentials_file: api_key.txt
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: rag-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
